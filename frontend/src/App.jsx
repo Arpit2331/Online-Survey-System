@@ -20,7 +20,7 @@ const Dashboard = ({ user, onLogout }) => {
 
   const fetchSurveys = async () => {
     try {
-      const res = await axios.get('https://online-survey-system-backend.onrender.com/api/surveys/${user.email}`);
+      const res = await axios.get(`https://online-survey-system-backend.onrender.com/api/surveys/${user.email}`);
       setMySurveys(res.data);
     } catch (err) { console.error(err); }
   };
