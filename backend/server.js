@@ -9,59 +9,18 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// AUTO-DB INITIALIZATION
-const initDb = async () => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(100),
-        email VARCHAR(100) UNIQUE NOT NULL,
-        password VARCHAR(100) NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS surveys (
-        id SERIAL PRIMARY KEY,
-        title VARCHAR(255) NOT NULL,
-        description TEXT,
-        creator_email VARCHAR(100)
-      );
-      CREATE TABLE IF NOT EXISTS questions (
-        id SERIAL PRIMARY KEY,
-        survey_id INTEGER REFERENCES surveys(id) ON DELETE CASCADE,
-        question_text TEXT NOT NULL,
-        question_type VARCHAR(50) NOT NULL,
-        options JSONB
-      );
-    `);
-    console.log("✅ Database tables verified");
-  } catch (err) {
-    console.error("❌ DB Init Error:", err.message);
-  }
-};
-initDb();
-
-// SIGNUP ROUTE
+// --- AUTH ---
 app.post('/auth/signup', async (req, res) => {
   const { name, email, password } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING email',
-      [name, email.toLowerCase(), hashedPassword]
-    );
-    const token = jwt.sign({ email: result.rows[0].email }, process.env.JWT_SECRET);
-    res.json({ success: true, token, user: { email: result.rows[0].email } });
-  } catch (err) {
-    res.status(500).json({ success: false, error: "Email already registered" });
-  }
+    await pool.query('INSERT INTO users (name, email, password) VALUES ($1, $2, $3)', [name, email.toLowerCase(), hashedPassword]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ success: false }); }
 });
 
-// LOGIN ROUTE
 app.post('/auth/login', async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -69,29 +28,70 @@ app.post('/auth/login', async (req, res) => {
     if (result.rows.length > 0) {
       const isMatch = await bcrypt.compare(password, result.rows[0].password);
       if (isMatch) {
-        const token = jwt.sign({ email: result.rows[0].email }, process.env.JWT_SECRET);
-        return res.json({ success: true, token, user: { email: result.rows[0].email } });
+        const token = jwt.sign({ user_id: result.rows[0].user_id }, process.env.JWT_SECRET || 'dev_secret');
+        return res.json({ success: true, token, user: { email: result.rows[0].email, name: result.rows[0].name } });
       }
     }
-    res.status(401).json({ success: false, error: "Invalid email or password" });
-  } catch (err) {
-    res.status(500).json({ success: false, error: "Server error" });
-  }
+    res.status(401).json({ success: false });
+  } catch (err) { res.status(500).json({ success: false }); }
 });
 
-// SURVEY ROUTE
-app.post('/api/surveys', async (req, res) => {
-  const { title, description, creator_email } = req.body;
+// --- DASHBOARD DATA ---
+app.get('/api/surveys', async (req, res) => {
   try {
-    const result = await pool.query(
-      'INSERT INTO surveys (title, description, creator_email) VALUES ($1, $2, $3) RETURNING id',
-      [title, description, creator_email]
-    );
-    res.json({ success: true, surveyId: result.rows[0].id });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+    const user = await pool.query('SELECT user_id FROM users WHERE email = $1', [req.query.email]);
+    const result = await pool.query('SELECT * FROM surveys WHERE user_id = $1 ORDER BY created_at DESC', [user.rows[0].user_id]);
+    res.json({ success: true, surveys: result.rows });
+  } catch (err) { res.status(500).json({ success: false }); }
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.post('/api/surveys', async (req, res) => {
+  const { title, creator_email } = req.body;
+  try {
+    const user = await pool.query('SELECT user_id FROM users WHERE email = $1', [creator_email]);
+    const result = await pool.query('INSERT INTO surveys (user_id, title) VALUES ($1, $2) RETURNING survey_id', [user.rows[0].user_id, title]);
+    res.json({ success: true, surveyId: result.rows[0].survey_id });
+  } catch (err) { res.status(500).json({ success: false }); }
+});
+
+app.post('/api/questions', async (req, res) => {
+  const { survey_id, question_text, question_type } = req.body;
+  try {
+    await pool.query('INSERT INTO questions (survey_id, question_text, question_type) VALUES ($1, $2, $3)', [survey_id, question_text, question_type]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ success: false }); }
+});
+
+// --- NEW ANALYTICS ROUTE ---
+app.get('/api/surveys/:id/responses', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT r.response_value, q.question_text, r.submitted_at 
+      FROM responses r
+      JOIN questions q ON r.question_id = q.question_id
+      WHERE r.survey_id = $1
+      ORDER BY r.submitted_at DESC`, [req.params.id]);
+    res.json({ success: true, responses: result.rows });
+  } catch (err) { res.status(500).json({ success: false }); }
+});
+
+// --- PUBLIC VIEW ---
+app.get('/api/public/surveys/:id', async (req, res) => {
+  try {
+    const s = await pool.query('SELECT * FROM surveys WHERE survey_id = $1', [req.params.id]);
+    const q = await pool.query('SELECT * FROM questions WHERE survey_id = $1', [req.params.id]);
+    res.json({ success: true, survey: s.rows[0], questions: q.rows });
+  } catch (err) { res.status(500).json({ success: false }); }
+});
+
+app.post('/api/public/responses', async (req, res) => {
+  const { survey_id, answers } = req.body;
+  try {
+    for (let a of answers) {
+      await pool.query('INSERT INTO responses (survey_id, question_id, response_value) VALUES ($1, $2, $3)', [survey_id, a.question_id, a.val]);
+    }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ success: false }); }
+});
+
+app.listen(5000, () => console.log("🚀 Server: http://localhost:5000"));
